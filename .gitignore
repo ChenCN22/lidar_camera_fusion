@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# ROS 2 / colcon build artifacts
+# ---------------------------------------------------------------------------
+build/
+install/
+log/
+devel/
+
+# ament / colcon metadata
+.catkin_tools/
+.catkin_workspace
+COLCON_IGNORE
+AMENT_IGNORE
+
+# ---------------------------------------------------------------------------
+# C / C++ build artifacts
+# ---------------------------------------------------------------------------
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.lib
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+*.la
+*.lo
+*.slo
+*.gch
+*.pch
+*.d
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+cmake-build-*/
+CTestTestfile.cmake
+_deps/
+compile_commands.json
+Testing/
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.cache/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# clangd / LSP
+.clangd/
+.ccls-cache/
+
+# ---------------------------------------------------------------------------
+# Project-specific
+# ---------------------------------------------------------------------------
+# Scratch / notes files accidentally left in src/
+src/*.txt
