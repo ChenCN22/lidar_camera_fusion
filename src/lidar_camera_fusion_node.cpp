@@ -1,20 +1,29 @@
 /**
  * lidar_camera_fusion_node.cpp
  *
- * Subscribes to an image topic and a LiDAR PointCloud2 topic, reads the
- * extrinsic calibration from /tmp/preprocessed/calib.json, and publishes:
+ * Registers one or two cameras against a single LiDAR.  For each camera it
+ * subscribes to that camera's image topic, reads that camera's extrinsic
+ * calibration json, and publishes:
  *   1. A colored PointCloud2 (each point painted with its camera-image colour)
  *      at the LiDAR rate (~10 Hz).
  *   2. An overlap image (LiDAR points projected and drawn on top of the camera
  *      image) at the image rate (~30 Hz / FPS).
  *
- * Because /image timestamps typically lag the /ouster/points timestamps by
+ * The second camera is optional: leave "calib_path_back" empty and the node
+ * runs with one camera exactly as it always did.  The two cameras are entirely
+ * independent copies of the same pipeline - separate calibration, separate
+ * cloud FIFO, separate output topics.  They share only the LiDAR subscription,
+ * the depth colormap and the tuning parameters.
+ *
+ * Because the image timestamps typically lag the /ouster/points timestamps by
  * ~300 ms, a cloud FIFO queue of configurable depth (default 3 frames) is
  * used: the oldest cloud in the queue is colourised with the current image,
- * so the depth-3 delay at 10 Hz compensates for the 300 ms offset.
+ * so the depth-3 delay at 10 Hz compensates for the 300 ms offset.  Each
+ * camera owns its own FIFO - a shared one would not work, because the image
+ * callback pops from it and the two cameras would steal each other's clouds.
  *
- * ApproximateTimeSynchronizer drives the ~10 Hz colorisation pipeline;
- * a separate direct image subscriber drives the 30 Hz overlay publishing.
+ * Direct subscriptions with manual queue management drive both paths; there is
+ * no message_filters synchronizer.
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -45,6 +54,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <memory>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -204,33 +214,80 @@ public:
     declare_parameter("cloud_topic",          "/ouster/points");
     declare_parameter("calib_path",           "/tmp/preprocessed");
     declare_parameter("queue_size",           3);
+    // (09/17) image subscription QoS: "reliable" (default) matches the Insta360
+    // driver's RELIABLE publisher so lost UDP fragments are repaired instead of
+    // dropping the frame; "sensor" = the old BEST_EFFORT SensorDataQoS.
+    declare_parameter("image_qos",            "reliable");
     declare_parameter("overlap_image_topic",  "/overlap_image");
     declare_parameter("colored_cloud_topic",  "/colored_cloud");
     declare_parameter("point_radius",         2);
+    // Drop returns further than this from the sensor, in metres.  <= 0 disables
+    // the filter and keeps the whole cloud.
+    declare_parameter("max_distance",         8.0);
+    // Second camera.  Leave "calib_path_back" empty to run with one lens, in
+    // which case the node behaves exactly as it did before it grew a second.
+    declare_parameter("image_topic_back",         "/camera_back");
+    declare_parameter("calib_path_back",          "");
+    declare_parameter("overlap_image_topic_back", "/overlap_image_back");
+    declare_parameter("colored_cloud_topic_back", "/colored_cloud_back");
 
-    const auto image_topic   = get_parameter("image_topic").as_string();
     const auto cloud_topic   = get_parameter("cloud_topic").as_string();
-    const auto calib_path    = get_parameter("calib_path").as_string();
     queue_size_              = get_parameter("queue_size").as_int();
     point_radius_            = get_parameter("point_radius").as_int();
+    max_distance_            = get_parameter("max_distance").as_double();
 
-    RCLCPP_INFO(get_logger(), "image_topic  : %s", image_topic.c_str());
     RCLCPP_INFO(get_logger(), "cloud_topic  : %s", cloud_topic.c_str());
-    RCLCPP_INFO(get_logger(), "calib_path   : %s", calib_path.c_str());
     RCLCPP_INFO(get_logger(), "queue_size   : %d", queue_size_);
+    if (max_distance_ > 0.0) {
+      RCLCPP_INFO(get_logger(), "max_distance : %.2f m", max_distance_);
+    } else {
+      RCLCPP_INFO(get_logger(), "max_distance : disabled (keeping all points)");
+    }
 
     // -----------------------------------------------------------------------
-    // Calibration
+    // Cameras
+    //
+    // Each camera is an independent copy of the same registration pipeline:
+    // its own calibration, its own cloud FIFO, its own overlay image and its
+    // own coloured cloud.  The LiDAR, the colormap and the tuning parameters
+    // are the only things they share.
     // -----------------------------------------------------------------------
-    loadCalib(calib_path);
+    cameras_.reserve(2);
+
+    Camera front;
+    front.index               = 0;
+    front.name                = "front";
+    front.image_topic         = get_parameter("image_topic").as_string();
+    front.calib_path          = get_parameter("calib_path").as_string();
+    front.overlay_topic       = get_parameter("overlap_image_topic").as_string();
+    front.colored_cloud_topic = get_parameter("colored_cloud_topic").as_string();
+    cameras_.push_back(std::move(front));
+
+    const auto back_calib = get_parameter("calib_path_back").as_string();
+    if (back_calib.empty()) {
+      RCLCPP_INFO(get_logger(),
+        "calib_path_back is empty - running with one camera");
+    } else {
+      Camera back;
+      back.index               = 1;
+      back.name                = "back";
+      back.image_topic         = get_parameter("image_topic_back").as_string();
+      back.calib_path          = back_calib;
+      back.overlay_topic       = get_parameter("overlap_image_topic_back").as_string();
+      back.colored_cloud_topic = get_parameter("colored_cloud_topic_back").as_string();
+      cameras_.push_back(std::move(back));
+    }
 
     // -----------------------------------------------------------------------
-    // Publishers
+    // Calibration + publishers, per camera
     // -----------------------------------------------------------------------
-    overlap_image_pub_ = create_publisher<ImageMsg>(
-      get_parameter("overlap_image_topic").as_string(), 10);
-    colored_cloud_pub_ = create_publisher<CloudMsg>(
-      get_parameter("colored_cloud_topic").as_string(), 10);
+    for (auto& cam : cameras_) {
+      RCLCPP_INFO(get_logger(), "camera '%s' : %s  <-  %s",
+        cam.name.c_str(), cam.image_topic.c_str(), cam.calib_path.c_str());
+      loadCalib(cam);
+      cam.overlap_image_pub = create_publisher<ImageMsg>(cam.overlay_topic, 10);
+      cam.colored_cloud_pub = create_publisher<CloudMsg>(cam.colored_cloud_topic, 10);
+    }
 
     // -----------------------------------------------------------------------
     // Direct subscriptions with manual queue management
@@ -243,48 +300,90 @@ public:
     //
     // Both topics are sensor data, so use SensorDataQoS (BEST_EFFORT, volatile).
     // -----------------------------------------------------------------------
-    image_sub_ = create_subscription<ImageMsg>(
-      image_topic,
-      rclcpp::SensorDataQoS(),
-      std::bind(&LidarCameraFusionNode::imageCallback, this, std::placeholders::_1));
+    // Subscriptions are created last and capture the camera INDEX, so nothing
+    // can dangle if cameras_ ever reallocates.
+    const std::string image_qos_name = get_parameter("image_qos").as_string();
+    const rclcpp::QoS image_qos = (image_qos_name == "sensor")
+      ? rclcpp::QoS(rclcpp::SensorDataQoS())
+      : rclcpp::QoS(rclcpp::KeepLast(3)).reliable().durability_volatile();
+    RCLCPP_INFO(get_logger(), "image subscription QoS: %s", image_qos_name.c_str());
+    for (size_t i = 0; i < cameras_.size(); ++i) {
+      cameras_[i].image_sub = create_subscription<ImageMsg>(
+        cameras_[i].image_topic,
+        image_qos,
+        [this, i](const ImageMsg::ConstSharedPtr msg) { imageCallback(i, msg); });
+    }
 
     cloud_direct_sub_ = create_subscription<CloudMsg>(
       cloud_topic,
       rclcpp::SensorDataQoS(),
       std::bind(&LidarCameraFusionNode::cloudCallback, this, std::placeholders::_1));
 
-    RCLCPP_INFO(get_logger(), "lidar_camera_fusion node ready");
+    RCLCPP_INFO(get_logger(), "lidar_camera_fusion node ready (%zu camera%s)",
+      cameras_.size(), cameras_.size() == 1 ? "" : "s");
   }
 
 private:
+  /// Everything that belongs to one lens.  The LiDAR, the colormap and the
+  /// tuning parameters (queue_size / point_radius / max_distance) are shared;
+  /// this is the state that is not.
+  struct Camera
+  {
+    size_t               index{0};              ///< position in cameras_
+    std::string          name;                  ///< "front" / "back", for logs
+    std::string          image_topic;
+    std::string          calib_path;
+    std::string          overlay_topic;
+    std::string          colored_cloud_topic;
+
+    // --- calibration (written by loadCalib) ---
+    Eigen::Isometry3d    T_camera_lidar{Eigen::Isometry3d::Identity()};
+    // This lens' optical axis (+z) expressed in the LiDAR frame.  Used to
+    // decide, for a point both lenses can see, which lens owns it - see the
+    // ownership test in colorizeAndPublish.
+    Eigen::Vector3d      optical_axis_lidar{Eigen::Vector3d::UnitX()};
+    std::string          camera_model;
+    std::vector<double>  intrinsics;
+    std::vector<double>  distortion;
+
+    // --- io ---
+    rclcpp::Subscription<ImageMsg>::SharedPtr  image_sub;
+    rclcpp::Publisher<ImageMsg>::SharedPtr     overlap_image_pub;
+    rclcpp::Publisher<CloudMsg>::SharedPtr     colored_cloud_pub;
+
+    // --- state (guarded by state_mutex_) ---
+    std::deque<CloudMsg::ConstSharedPtr>            cloud_deque;
+    std::vector<std::pair<cv::Point2i, cv::Vec3b>>  colored_points_2d;
+  };
+
   // =========================================================================
   // Calibration loading
   // =========================================================================
 
-  void loadCalib(const std::string& calib_path)
+  void loadCalib(Camera& cam)
   {
-    std::ifstream ifs(calib_path + "/calib.json");
+    std::ifstream ifs(cam.calib_path);
     if (!ifs) {
-      RCLCPP_FATAL(get_logger(), "Cannot open %s/calib.json", calib_path.c_str());
+      RCLCPP_FATAL(get_logger(), "Cannot open %s", cam.calib_path.c_str());
       throw std::runtime_error("Cannot open calib.json");
     }
 
     nlohmann::json cfg;
     ifs >> cfg;
 
-    camera_model_    = cfg["camera"]["camera_model"].get<std::string>();
-    intrinsics_      = cfg["camera"]["intrinsics"].get<std::vector<double>>();
-    distortion_      = cfg["camera"]["distortion_coeffs"].get<std::vector<double>>();
+    cam.camera_model = cfg["camera"]["camera_model"].get<std::string>();
+    cam.intrinsics   = cfg["camera"]["intrinsics"].get<std::vector<double>>();
+    cam.distortion   = cfg["camera"]["distortion_coeffs"].get<std::vector<double>>();
 
-    RCLCPP_INFO(get_logger(), "camera_model : %s", camera_model_.c_str());
+    RCLCPP_INFO(get_logger(), "  camera_model : %s", cam.camera_model.c_str());
 
     // Prefer the final calibrated transform; fall back to the automatic guess.
     std::vector<double> tum;
     if (cfg.count("results") && cfg["results"].count("T_lidar_camera")) {
-      RCLCPP_INFO(get_logger(), "Using T_lidar_camera (calibrated result)");
+      RCLCPP_INFO(get_logger(), "  using T_lidar_camera (calibrated result)");
       tum = cfg["results"]["T_lidar_camera"].get<std::vector<double>>();
     } else if (cfg.count("results") && cfg["results"].count("init_T_lidar_camera_auto")) {
-      RCLCPP_INFO(get_logger(), "Using init_T_lidar_camera_auto");
+      RCLCPP_INFO(get_logger(), "  using init_T_lidar_camera_auto");
       tum = cfg["results"]["init_T_lidar_camera_auto"].get<std::vector<double>>();
     } else {
       RCLCPP_FATAL(get_logger(), "No T_lidar_camera in calib.json results");
@@ -297,8 +396,19 @@ private:
     T_lidar_camera.linear() =
       Eigen::Quaterniond(tum[6], tum[3], tum[4], tum[5]).normalized().toRotationMatrix();
 
-    T_camera_lidar_ = T_lidar_camera.inverse();
-    RCLCPP_INFO_STREAM(get_logger(), "T_camera_lidar:\n" << T_camera_lidar_.matrix());
+    cam.T_camera_lidar = T_lidar_camera.inverse();
+
+    // Optical axis (camera +z) in the LiDAR frame = R_lidar_camera * e_z.
+    // R_lidar_camera is the rotation of T_lidar_camera, i.e. the transpose of
+    // R_camera_lidar.  This is a unit vector already (rotation column).
+    cam.optical_axis_lidar =
+      cam.T_camera_lidar.linear().transpose().col(2).normalized();
+
+    RCLCPP_INFO_STREAM(get_logger(),
+      "  T_camera_lidar:\n" << cam.T_camera_lidar.matrix());
+    RCLCPP_INFO(get_logger(), "  optical axis in LiDAR frame: [%.3f %.3f %.3f]",
+      cam.optical_axis_lidar.x(), cam.optical_axis_lidar.y(),
+      cam.optical_axis_lidar.z());
   }
 
   // =========================================================================
@@ -309,19 +419,19 @@ private:
    * @brief Project a point in camera-frame to pixel coordinates.
    * @return Pixel (u, v).  May be out-of-image – caller must bounds-check.
    */
-  Eigen::Vector2d projectPoint(const Eigen::Vector3d& pt_cam) const
+  Eigen::Vector2d projectPoint(const Camera& cam, const Eigen::Vector3d& pt_cam) const
   {
-    if (camera_model_ == "fisheye") {
-      return projectFisheye(pt_cam, intrinsics_, distortion_);
+    if (cam.camera_model == "fisheye") {
+      return projectFisheye(pt_cam, cam.intrinsics, cam.distortion);
     }
-    if (camera_model_ == "equirectangular") {
-      return projectEquirectangular(pt_cam, intrinsics_);
+    if (cam.camera_model == "equirectangular") {
+      return projectEquirectangular(pt_cam, cam.intrinsics);
     }
-    if (camera_model_ == "omnidir") {
-      return projectOmnidir(pt_cam, intrinsics_, distortion_);
+    if (cam.camera_model == "omnidir") {
+      return projectOmnidir(pt_cam, cam.intrinsics, cam.distortion);
     }
     // plumb_bob / atan: use pinhole-based projection
-    return projectPinhole(pt_cam, intrinsics_, distortion_);
+    return projectPinhole(pt_cam, cam.intrinsics, cam.distortion);
   }
 
   // =========================================================================
@@ -331,13 +441,20 @@ private:
   void cloudCallback(const CloudMsg::ConstSharedPtr& msg)
   {
     std::lock_guard<std::mutex> lk(state_mutex_);
-    cloud_deque_.push_back(msg);
 
-    // Keep only the most recent queue_size_ frames in the FIFO.
-    // The oldest frame in the queue is ~(queue_size * 100ms) = 300ms old,
-    // which compensates for the image lag.
-    while (static_cast<int>(cloud_deque_.size()) > queue_size_) {
-      cloud_deque_.pop_front();
+    // Every camera gets its OWN FIFO holding the same message.  A shared queue
+    // would not work: imageCallback pops from it, so the two cameras would
+    // steal each other's clouds and each would only see about half of them.
+    // Pushing the shared_ptr into both copies a refcount, not the payload.
+    for (auto& cam : cameras_) {
+      cam.cloud_deque.push_back(msg);
+
+      // Keep only the most recent queue_size_ frames in the FIFO.
+      // The oldest frame in the queue is ~(queue_size * 100ms) = 300ms old,
+      // which compensates for the image lag.
+      while (static_cast<int>(cam.cloud_deque.size()) > queue_size_) {
+        cam.cloud_deque.pop_front();
+      }
     }
   }
 
@@ -345,44 +462,62 @@ private:
   // Image callback – 30 Hz: trigger colorisation & overlay publishing
   // =========================================================================
 
-  void imageCallback(const ImageMsg::ConstSharedPtr& msg)
+  void imageCallback(size_t idx, const ImageMsg::ConstSharedPtr& msg)
   {
+    Camera& cam = cameras_[idx];
+
     // Convert to BGR
     cv_bridge::CvImageConstPtr cv_ptr;
     try {
       cv_ptr = cv_bridge::toCvShare(msg, "bgr8");
     } catch (const std::exception& e) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "cv_bridge: %s", e.what());
+        "cv_bridge (%s): %s", cam.name.c_str(), e.what());
       return;
     }
 
-    cv::Mat current_image = cv_ptr->image.clone();
+    // No clone here: colorize only READS the image, and the overlay is drawn
+    // into a freshly allocated output message below.  The old code copied the
+    // ~6 MB frame three times per callback (clone here, clone for the overlay,
+    // and again inside toImageMsg); at 30 Hz on two cameras that triple copy
+    // was a large slice of the CPU load.
+    const cv::Mat& img = cv_ptr->image;
 
-    // If the cloud queue is full, pop the oldest cloud and colorize
+    // If the cloud queue is full, pop the oldest cloud and colorize.
     CloudMsg::ConstSharedPtr oldest_cloud;
     {
       std::lock_guard<std::mutex> lk(state_mutex_);
-
-      // Trigger colorisation only when the queue is full
-      if (static_cast<int>(cloud_deque_.size()) >= queue_size_) {
-        oldest_cloud = cloud_deque_.front();
-        cloud_deque_.pop_front();
+      if (static_cast<int>(cam.cloud_deque.size()) >= queue_size_) {
+        oldest_cloud = cam.cloud_deque.front();
+        cam.cloud_deque.pop_front();
       }
     }
 
     if (oldest_cloud) {
-      colorizeAndPublish(oldest_cloud, current_image, msg->header);
+      colorizeAndPublish(cam, oldest_cloud, img);
     }
 
-    // Draw coloured LiDAR projections from the last colorisation pass
+    // Draw the most recent colorisation pass onto the current frame.
     std::vector<std::pair<cv::Point2i, cv::Vec3b>> pts;
     {
       std::lock_guard<std::mutex> lk(state_mutex_);
-      pts = colored_points_2d_;
+      pts = cam.colored_points_2d;
     }
 
-    cv::Mat overlay = current_image.clone();
+    // Allocate the outgoing image and draw straight into its data buffer -
+    // one copy (img -> overlay) instead of three.
+    auto out_img = std::make_unique<ImageMsg>();
+    out_img->header       = msg->header;
+    out_img->height       = static_cast<uint32_t>(img.rows);
+    out_img->width        = static_cast<uint32_t>(img.cols);
+    out_img->encoding     = "bgr8";
+    out_img->is_bigendian = 0;
+    out_img->step         = static_cast<uint32_t>(img.cols) * 3;
+    out_img->data.resize(static_cast<size_t>(out_img->step) * img.rows);
+
+    cv::Mat overlay(img.rows, img.cols, CV_8UC3,
+                    out_img->data.data(), out_img->step);
+    img.copyTo(overlay);
     for (const auto& [pt, bgr] : pts) {
       if (pt.x >= 0 && pt.x < overlay.cols && pt.y >= 0 && pt.y < overlay.rows) {
         cv::circle(overlay, pt, point_radius_,
@@ -390,8 +525,7 @@ private:
       }
     }
 
-    overlap_image_pub_->publish(
-      *cv_bridge::CvImage(msg->header, "bgr8", overlay).toImageMsg());
+    cam.overlap_image_pub->publish(std::move(out_img));
   }
 
   // =========================================================================
@@ -403,9 +537,9 @@ private:
    *        colormap for the overlay image.
    */
   void colorizeAndPublish(
+    Camera& cam,
     const CloudMsg::ConstSharedPtr& cloud_msg,
-    const cv::Mat& image,
-    const std_msgs::msg::Header& /*image_header*/)
+    const cv::Mat& image)
   {
     // ------------------------------------------------------------------
     // Parse the input PointCloud2 field offsets and data types
@@ -421,7 +555,7 @@ private:
 
     if (x_off < 0 || y_off < 0 || z_off < 0) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Input cloud is missing x/y/z fields – skipping");
+        "[%s] input cloud is missing x/y/z fields – skipping", cam.name.c_str());
       return;
     }
 
@@ -429,48 +563,30 @@ private:
     const int   src_step   = static_cast<int>(cloud_msg->point_step);
     const bool  is_float64 = (xyz_type == PointField::FLOAT64);
 
+    const uint8_t* src_base = cloud_msg->data.data();
+
     // ------------------------------------------------------------------
-    // Build output PointCloud2: x y z (FLOAT32) + rgb (UINT32 as FLOAT32)
+    // Single pass over the raw cloud: distance-filter, transform, project.
+    //
+    // Only points that actually land in THIS lens' image are kept.  Points in
+    // the opposite hemisphere never project into bounds, so they are dropped
+    // here instead of being carried in the output as black filler - that is
+    // the "crop the opposite side" the two clouds now do.
+    //
+    // Reading the raw buffer once (the old code read it twice) is the main
+    // per-frame CPU saving.
     // ------------------------------------------------------------------
-    CloudMsg out;
-    out.header       = cloud_msg->header;
-    out.height       = 1;
-    out.width        = static_cast<uint32_t>(num_pts);
-    out.is_dense     = false;
-    out.is_bigendian = false;
+    struct Hit { float x, y, z; uint32_t rgb; int32_t u, v; float depth; };
+    static thread_local std::vector<Hit> hits;   // reused across frames
+    hits.clear();
+    hits.reserve(static_cast<size_t>(num_pts) / 2);
 
-    const auto push_field = [&](const std::string& name, uint32_t offset, uint8_t dtype) {
-      PointField f;
-      f.name     = name;
-      f.offset   = offset;
-      f.datatype = dtype;
-      f.count    = 1;
-      out.fields.push_back(f);
-    };
-    push_field("x",   0,  PointField::FLOAT32);
-    push_field("y",   4,  PointField::FLOAT32);
-    push_field("z",   8,  PointField::FLOAT32);
-    push_field("rgb", 12, PointField::FLOAT32);  // PCL-convention packed RGB
+    const bool is_wide = (cam.camera_model == "equirectangular" ||
+                          cam.camera_model == "omnidir" ||
+                          cam.camera_model == "fisheye");
 
-    out.point_step = 16;
-    out.row_step   = out.point_step * static_cast<uint32_t>(num_pts);
-    out.data.assign(out.row_step, 0);
-
-    // Temporary container for 2-D overlay points with depth-based color
-    std::vector<std::pair<cv::Point2i, cv::Vec3b>> new_pts_2d_overlay;
-    new_pts_2d_overlay.reserve(static_cast<size_t>(num_pts) / 4);
-
-    // Compute depth range for normalization
     double min_depth = std::numeric_limits<double>::max();
     double max_depth = std::numeric_limits<double>::lowest();
-
-    // ------------------------------------------------------------------
-    // First pass: compute depth range and project points
-    // ------------------------------------------------------------------
-    const uint8_t* src_base = cloud_msg->data.data();
-    std::vector<std::pair<int, int>>     projected_2d(num_pts, {-1, -1});
-    std::vector<double>                  point_depths(num_pts, -1.0);
-    std::vector<cv::Vec3b>               point_colors(num_pts);
 
     for (int i = 0; i < num_pts; ++i) {
       const uint8_t* src = src_base + i * src_step;
@@ -490,109 +606,142 @@ private:
         continue;
       }
 
-      // Transform to camera frame
-      const Eigen::Vector4d pt_lidar(x, y, z, 1.0);
-      const Eigen::Vector4d pt_cam = T_camera_lidar_ * pt_lidar;
-
-      // Reject points clearly behind the camera.  Omnidir/fisheye support
-      // a >180° FoV so we only apply the z<=0 prune for pinhole-like models;
-      // projectOmnidir itself returns NaN for points outside the valid
-      // unified-sphere hemisphere.
-      if (camera_model_ != "equirectangular" &&
-          camera_model_ != "omnidir" &&
-          camera_model_ != "fisheye" &&
-          pt_cam.z() <= 0.01) {
+      // Distance filter: range from the LiDAR origin, which is what "N metres
+      // away" means physically (the camera sits ~15 cm from it).
+      const double range = std::sqrt(static_cast<double>(x) * x +
+                                     static_cast<double>(y) * y +
+                                     static_cast<double>(z) * z);
+      if (max_distance_ > 0.0 && range > max_distance_) {
         continue;
       }
 
-      // Project to pixel
-      const Eigen::Vector2d px = projectPoint(pt_cam.head<3>());
+      // Ownership: where two lenses overlap, the same physical point would
+      // otherwise appear in BOTH clouds - coloured from opposite fisheye edges
+      // and updated at different times - which flickers when they are rendered
+      // together.  Assign each point to the single lens whose optical axis
+      // points most directly at it (largest dot product with the view
+      // direction), so the two clouds are a clean, disjoint partition.  Ties go
+      // to the lower-index lens.  This uses the direction from the LiDAR origin;
+      // the ~9 cm inter-lens baseline shifts the seam by well under a degree at
+      // these ranges.
+      if (cameras_.size() > 1) {
+        const Eigen::Vector3d dir(static_cast<double>(x) / range,
+                                  static_cast<double>(y) / range,
+                                  static_cast<double>(z) / range);
+        const double dot_self = dir.dot(cam.optical_axis_lidar);
+        bool owned = true;
+        for (const auto& other : cameras_) {
+          if (other.index == cam.index) {
+            continue;
+          }
+          const double dot_other = dir.dot(other.optical_axis_lidar);
+          if (dot_other > dot_self ||
+              (dot_other == dot_self && other.index < cam.index)) {
+            owned = false;
+            break;
+          }
+        }
+        if (!owned) {
+          continue;   // the other lens owns this point
+        }
+      }
+
+      // Transform to camera frame.
+      const Eigen::Vector4d pt_lidar(x, y, z, 1.0);
+      const Eigen::Vector4d pt_cam = cam.T_camera_lidar * pt_lidar;
+
+      // Reject points clearly behind a pinhole-like camera.  Wide-angle models
+      // legitimately see z <= 0; projectOmnidir returns NaN outside its valid
+      // hemisphere.
+      if (!is_wide && pt_cam.z() <= 0.01) {
+        continue;
+      }
+
+      const Eigen::Vector2d px = projectPoint(cam, pt_cam.head<3>());
       if (!std::isfinite(px.x()) || !std::isfinite(px.y())) {
         continue;
       }
       const int u = static_cast<int>(std::round(px.x()));
       const int v = static_cast<int>(std::round(px.y()));
-
       if (u < 0 || u >= image.cols || v < 0 || v >= image.rows) {
-        continue;
+        continue;   // outside this lens' image -> other hemisphere, drop it
       }
 
-      // Store projection and depth.  Use radial distance (norm) rather than
-      // z so that omnidir points with a valid but non-positive z still get a
-      // monotone colormap scaling.
+      // Radial distance rather than z, so omnidir points with a valid but
+      // non-positive z still get a monotone colormap scaling.
       const double depth = pt_cam.head<3>().norm();
-      projected_2d[i] = {u, v};
-      point_depths[i] = depth;
-      point_colors[i] = image.at<cv::Vec3b>(v, u);
+      const cv::Vec3b bgr = image.at<cv::Vec3b>(v, u);
+      const uint32_t rgb32 = (static_cast<uint32_t>(bgr[2]) << 16) |
+                             (static_cast<uint32_t>(bgr[1]) <<  8) |
+                              static_cast<uint32_t>(bgr[0]);
 
-      // Update depth range
+      hits.push_back({x, y, z, rgb32, u, v, static_cast<float>(depth)});
       min_depth = std::min(min_depth, depth);
       max_depth = std::max(max_depth, depth);
     }
 
-    // Normalize depth for colormap lookup
     const double depth_range = (max_depth > min_depth) ? (max_depth - min_depth) : 1.0;
 
     // ------------------------------------------------------------------
-    // Second pass: colorize points and build outputs
+    // Build the cropped coloured cloud: x y z (FLOAT32) + rgb, one entry per
+    // kept point.  Because every point here is a valid coloured return the
+    // cloud is dense.
     // ------------------------------------------------------------------
-    uint8_t* dst_base = out.data.data();
+    const size_t n_out = hits.size();
 
-    for (int i = 0; i < num_pts; ++i) {
-      const uint8_t* src = src_base + i * src_step;
-      uint8_t*       dst = dst_base + i * out.point_step;
+    auto out = std::make_unique<CloudMsg>();
+    out->header       = cloud_msg->header;
+    out->height       = 1;
+    out->width        = static_cast<uint32_t>(n_out);
+    out->is_dense     = true;
+    out->is_bigendian = false;
 
-      float x, y, z;
-      if (is_float64) {
-        x = static_cast<float>(*reinterpret_cast<const double*>(src + x_off));
-        y = static_cast<float>(*reinterpret_cast<const double*>(src + y_off));
-        z = static_cast<float>(*reinterpret_cast<const double*>(src + z_off));
-      } else {
-        x = *reinterpret_cast<const float*>(src + x_off);
-        y = *reinterpret_cast<const float*>(src + y_off);
-        z = *reinterpret_cast<const float*>(src + z_off);
-      }
+    const auto push_field = [&](const std::string& name, uint32_t offset, uint8_t dtype) {
+      PointField f;
+      f.name     = name;
+      f.offset   = offset;
+      f.datatype = dtype;
+      f.count    = 1;
+      out->fields.push_back(f);
+    };
+    push_field("x",   0,  PointField::FLOAT32);
+    push_field("y",   4,  PointField::FLOAT32);
+    push_field("z",   8,  PointField::FLOAT32);
+    push_field("rgb", 12, PointField::FLOAT32);  // PCL-convention packed RGB
+    out->point_step = 16;
+    out->row_step   = out->point_step * static_cast<uint32_t>(n_out);
+    out->data.resize(out->row_step);
 
-      // Write position to output
-      *reinterpret_cast<float*>(dst + 0) = x;
-      *reinterpret_cast<float*>(dst + 4) = y;
-      *reinterpret_cast<float*>(dst + 8) = z;
+    // Overlay projections (depth-colormapped) for imageCallback to draw.
+    std::vector<std::pair<cv::Point2i, cv::Vec3b>> new_pts_2d_overlay;
+    new_pts_2d_overlay.reserve(n_out);
 
-      // Skip points that weren't successfully projected
-      if (point_depths[i] < 0.0) {
-        continue;
-      }
+    uint8_t* dst = out->data.data();
+    for (const Hit& h : hits) {
+      *reinterpret_cast<float*>(dst + 0) = h.x;
+      *reinterpret_cast<float*>(dst + 4) = h.y;
+      *reinterpret_cast<float*>(dst + 8) = h.z;
+      std::memcpy(dst + 12, &h.rgb, 4);
+      dst += out->point_step;
 
-      const int u = projected_2d[i].first;
-      const int v = projected_2d[i].second;
-      const double depth = point_depths[i];
-      const cv::Vec3b bgr = point_colors[i];
-
-      // ---- For colored cloud: use RGB from image ----
-      const uint8_t r = bgr[2], g = bgr[1], b = bgr[0];
-      const uint32_t rgb32 = (static_cast<uint32_t>(r) << 16) |
-                             (static_cast<uint32_t>(g) <<  8) |
-                              static_cast<uint32_t>(b);
-      std::memcpy(dst + 12, &rgb32, 4);
-
-      // ---- For overlay image: use depth-based colormap ----
-      const double depth_norm = (depth - min_depth) / depth_range;  // [0, 1]
+      const double depth_norm = (h.depth - min_depth) / depth_range;  // [0, 1]
       const int colormap_idx =
         std::clamp(static_cast<int>(depth_norm * 255.0), 0, 255);
-      new_pts_2d_overlay.emplace_back(cv::Point2i(u, v), depth_colormap_[colormap_idx]);
+      new_pts_2d_overlay.emplace_back(cv::Point2i(h.u, h.v),
+                                      depth_colormap_[colormap_idx]);
     }
 
-    // Update the shared 2-D projections (depth-colored) for imageCallback
+    // Hand the overlay projections to imageCallback.
     {
       std::lock_guard<std::mutex> lk(state_mutex_);
-      colored_points_2d_ = std::move(new_pts_2d_overlay);
+      cam.colored_points_2d = std::move(new_pts_2d_overlay);
     }
 
     RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 5000,
-      "Colorized %zu points for overlay", colored_points_2d_.size());
+      "[%s] %zu points coloured within %.2f m",
+      cam.name.c_str(), n_out, max_distance_);
 
-    // Publish coloured cloud
-    colored_cloud_pub_->publish(out);
+    cam.colored_cloud_pub->publish(std::move(out));
   }
 
 private:
@@ -644,27 +793,18 @@ private:
   // =========================================================================
 
   // --- parameters ---
-  int queue_size_{3};
-  int point_radius_{2};
+  int    queue_size_{3};
+  int    point_radius_{2};
+  double max_distance_{8.0};
 
-  // --- calibration ---
-  Eigen::Isometry3d       T_camera_lidar_{Eigen::Isometry3d::Identity()};
-  std::string             camera_model_;
-  std::vector<double>     intrinsics_;
-  std::vector<double>     distortion_;
+  // --- cameras (index 0 = front; index 1 = back, when configured) ---
+  std::vector<Camera> cameras_;
 
-  // --- subscriptions (direct, no ApproximateTimeSynchronizer) ---
-  rclcpp::Subscription<ImageMsg>::SharedPtr  image_sub_;
+  // --- the one thing both cameras share besides the parameters ---
   rclcpp::Subscription<CloudMsg>::SharedPtr  cloud_direct_sub_;
 
-  // --- publishers ---
-  rclcpp::Publisher<ImageMsg>::SharedPtr   overlap_image_pub_;
-  rclcpp::Publisher<CloudMsg>::SharedPtr   colored_cloud_pub_;
-
-  // --- shared state (protected by state_mutex_) ---
-  std::mutex                                              state_mutex_;
-  std::deque<CloudMsg::ConstSharedPtr>                   cloud_deque_;
-  std::vector<std::pair<cv::Point2i, cv::Vec3b>>          colored_points_2d_;
+  // --- guards every camera's cloud_deque and colored_points_2d ---
+  std::mutex  state_mutex_;
 };
 
 // ---------------------------------------------------------------------------
