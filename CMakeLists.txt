@@ -19,20 +19,16 @@ ament_auto_find_build_dependencies()
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED NO_MODULE)
 
-# nlohmann/json – prefer the cmake package, fall back to a bare header search,
-# then fall back to the copy bundled with direct_visual_lidar_calibration.
+# nlohmann/json (apt: nlohmann-json3-dev) - prefer the cmake package, fall back to a bare header search.
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
   find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
     HINTS
       /usr/include
       /usr/local/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/../direct_visual_lidar_calibration/thirdparty/json/include
   )
   if(NOT NLOHMANN_JSON_INCLUDE_DIR)
-    message(FATAL_ERROR
-      "nlohmann/json.hpp not found. Install nlohmann-json3-dev or ensure "
-      "direct_visual_lidar_calibration is present in the same workspace.")
+    message(FATAL_ERROR "nlohmann/json.hpp not found. Install nlohmann-json3-dev.")
   endif()
 endif()
 
@@ -73,4 +69,4 @@ install(TARGETS lidar_camera_fusion_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
-ament_auto_package()
+ament_auto_package(INSTALL_TO_SHARE launch config example)

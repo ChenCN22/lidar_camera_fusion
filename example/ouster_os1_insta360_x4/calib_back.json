@@ -1,0 +1,46 @@
+{
+  "camera": {
+    "camera_model": "omnidir",
+    "distortion_coeffs": [
+      -0.1927599065,
+      0.0215350375,
+      4.75447e-05,
+      -0.000775062
+    ],
+    "intrinsics": [
+      686.5503821737,
+      686.7161214465,
+      723.5388677704,
+      718.8619525904,
+      0.7477699374
+    ]
+  },
+  "meta": {
+    "bag_names": [
+      "registration_0820_1",
+      "registration_0820_2",
+      "registration_0820_3",
+      "registration_0820_4",
+      "registration_0820_5",
+      "registration_0820_6",
+      "registration_0820_7"
+    ],
+    "camera_info_topic": "/camera_info_omnidir",
+    "data_path": "/tmp/input_bags/",
+    "image_topic": "/camera_back",
+    "intensity_channel": "reflectivity",
+    "points_topic": "/ouster/points",
+    "note": "Back lens of the Insta360 dual-fisheye rig. Intrinsics come from back_fisheye_calibration.json (checkerboard, 2026-08-20, rms 0.367 px). The extrinsic is NOT from an independent LiDAR-camera registration: it is T_lidar_front (ouster_0_1_registered/calib.json) composed with the rigid front->back lens transform of the dual-fisheye rig, i.e. a 180 deg rotation about the camera Y axis plus a 94.3 mm baseline along the optical axis. The 180 deg flip and the baseline were verified/refined against the registration_0820_* bags by maximising LiDAR depth-edge / image-edge alignment on /camera_back (refinement over the exact flip: rx=+0.01 deg, ry=-0.65 deg, rz=+0.79 deg, baseline=0.0943 m); the refined value also improves alignment on held-out bags. Re-run the vlcal pipeline on /camera_back for a fully independent calibration."
+  },
+  "results": {
+    "T_lidar_camera": [
+      0.020072783754,
+      0.14496766933,
+      0.123858584904,
+      -0.492169343482,
+      0.499766055538,
+      -0.501234824593,
+      0.506721696481
+    ]
+  }
+}

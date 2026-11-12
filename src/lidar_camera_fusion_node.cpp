@@ -10,12 +10,12 @@
  *      image) at the image rate (~30 Hz / FPS).
  *
  * The second camera is optional: leave "calib_path_back" empty and the node
- * runs with one camera exactly as it always did.  The two cameras are entirely
+ * runs with one camera.  The two cameras are entirely
  * independent copies of the same pipeline - separate calibration, separate
  * cloud FIFO, separate output topics.  They share only the LiDAR subscription,
  * the depth colormap and the tuning parameters.
  *
- * Because the image timestamps typically lag the /ouster/points timestamps by
+ * Because the images of the rig this was written for lag the LiDAR clouds by
  * ~300 ms, a cloud FIFO queue of configurable depth (default 3 frames) is
  * used: the oldest cloud in the queue is colourised with the current image,
  * so the depth-3 delay at 10 Hz compensates for the 300 ms offset.  Each
@@ -214,9 +214,9 @@ public:
     declare_parameter("cloud_topic",          "/ouster/points");
     declare_parameter("calib_path",           "/tmp/preprocessed");
     declare_parameter("queue_size",           3);
-    // (09/17) image subscription QoS: "reliable" (default) matches the Insta360
-    // driver's RELIABLE publisher so lost UDP fragments are repaired instead of
-    // dropping the frame; "sensor" = the old BEST_EFFORT SensorDataQoS.
+    // Image subscription QoS: "reliable" (default) matches a RELIABLE image
+    // publisher so lost UDP fragments are repaired instead of dropping the
+    // frame; "sensor" = BEST_EFFORT SensorDataQoS.
     declare_parameter("image_qos",            "reliable");
     declare_parameter("overlap_image_topic",  "/overlap_image");
     declare_parameter("colored_cloud_topic",  "/colored_cloud");
@@ -224,8 +224,7 @@ public:
     // Drop returns further than this from the sensor, in metres.  <= 0 disables
     // the filter and keeps the whole cloud.
     declare_parameter("max_distance",         8.0);
-    // Second camera.  Leave "calib_path_back" empty to run with one lens, in
-    // which case the node behaves exactly as it did before it grew a second.
+    // Second camera.  Leave "calib_path_back" empty to run with one lens.
     declare_parameter("image_topic_back",         "/camera_back");
     declare_parameter("calib_path_back",          "");
     declare_parameter("overlap_image_topic_back", "/overlap_image_back");
@@ -298,7 +297,8 @@ public:
     // frames (~300 ms), we pop the oldest cloud and colorize it with the
     // current image.
     //
-    // Both topics are sensor data, so use SensorDataQoS (BEST_EFFORT, volatile).
+    // The cloud uses SensorDataQoS (BEST_EFFORT, volatile); the image QoS is
+    // selected by the image_qos parameter.
     // -----------------------------------------------------------------------
     // Subscriptions are created last and capture the camera INDEX, so nothing
     // can dangle if cameras_ ever reallocates.
@@ -477,10 +477,7 @@ private:
     }
 
     // No clone here: colorize only READS the image, and the overlay is drawn
-    // into a freshly allocated output message below.  The old code copied the
-    // ~6 MB frame three times per callback (clone here, clone for the overlay,
-    // and again inside toImageMsg); at 30 Hz on two cameras that triple copy
-    // was a large slice of the CPU load.
+    // into a freshly allocated output message below (one copy per frame).
     const cv::Mat& img = cv_ptr->image;
 
     // If the cloud queue is full, pop the oldest cloud and colorize.
@@ -570,11 +567,7 @@ private:
     //
     // Only points that actually land in THIS lens' image are kept.  Points in
     // the opposite hemisphere never project into bounds, so they are dropped
-    // here instead of being carried in the output as black filler - that is
-    // the "crop the opposite side" the two clouds now do.
-    //
-    // Reading the raw buffer once (the old code read it twice) is the main
-    // per-frame CPU saving.
+    // here instead of being carried in the output as black filler.
     // ------------------------------------------------------------------
     struct Hit { float x, y, z; uint32_t rgb; int32_t u, v; float depth; };
     static thread_local std::vector<Hit> hits;   // reused across frames
@@ -607,7 +600,7 @@ private:
       }
 
       // Distance filter: range from the LiDAR origin, which is what "N metres
-      // away" means physically (the camera sits ~15 cm from it).
+      // away" means physically.
       const double range = std::sqrt(static_cast<double>(x) * x +
                                      static_cast<double>(y) * y +
                                      static_cast<double>(z) * z);
@@ -621,9 +614,8 @@ private:
       // together.  Assign each point to the single lens whose optical axis
       // points most directly at it (largest dot product with the view
       // direction), so the two clouds are a clean, disjoint partition.  Ties go
-      // to the lower-index lens.  This uses the direction from the LiDAR origin;
-      // the ~9 cm inter-lens baseline shifts the seam by well under a degree at
-      // these ranges.
+      // to the lower-index lens.  This uses the direction from the LiDAR origin,
+      // which ignores the baseline between the lenses.
       if (cameras_.size() > 1) {
         const Eigen::Vector3d dir(static_cast<double>(x) / range,
                                   static_cast<double>(y) / range,

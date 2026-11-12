@@ -1,0 +1,54 @@
+{
+  "camera": {
+    "camera_model": "omnidir",
+    "distortion_coeffs": [
+      -0.190037,
+      0.020269,
+      -0.000258,
+      -0.001424
+    ],
+    "intrinsics": [
+      687.344052,
+      687.263911,
+      728.273899,
+      722.792744,
+      0.752012
+    ]
+  },
+  "meta": {
+    "bag_names": [
+      "registration_0820_1",
+      "registration_0820_2",
+      "registration_0820_3",
+      "registration_0820_4",
+      "registration_0820_5",
+      "registration_0820_6",
+      "registration_0820_7"
+    ],
+    "camera_info_topic": "/camera_info_omnidir",
+    "data_path": "/tmp/input_bags/",
+    "image_topic": "/camera_front",
+    "intensity_channel": "reflectivity",
+    "points_topic": "/ouster/points"
+  },
+  "results": {
+    "T_lidar_camera": [
+      -0.07420738501615597,
+      0.1462534955703994,
+      0.12236908804384086,
+      0.5074945518932318,
+      0.500346751239035,
+      -0.49277811475953026,
+      -0.4992716073814675
+    ],
+    "init_T_lidar_camera_auto": [
+      -0.05230997313757153,
+      0.07684512604370346,
+      0.06987989228493603,
+      -0.5087281172893496,
+      -0.4954401606357942,
+      0.4941623845383154,
+      0.5015359285393405
+    ]
+  }
+}

@@ -76,3 +76,6 @@ Thumbs.db
 # ---------------------------------------------------------------------------
 # Scratch / notes files accidentally left in src/
 src/*.txt
+
+# backups
+*.bak*

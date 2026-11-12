@@ -8,7 +8,7 @@
     topic, and publishes a coloured point cloud and an overlap image.
   </description>
 
-  <maintainer email="user@example.com">user</maintainer>
+  <maintainer email="shiyuche@andrew.cmu.edu">Shiyu Chen</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -18,7 +18,10 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>cv_bridge</depend>
-  <depend>message_filters</depend>
+  <depend>nlohmann-json-dev</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

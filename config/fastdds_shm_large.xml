@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Fast-DDS profile for large images between nodes on one host (rmw_fastrtps_cpp).
+     The default shared-memory segment is 512 KB; a 1440x1440 bgr8 image is 6.2 MB, so it falls back to UDPv4 loopback
+     in 65 KB fragments and frames are lost. This profile gives shared memory a 256 MB segment / 32 MB max message;
+     UDPv4 is kept for other hosts.
+     Use: export FASTRTPS_DEFAULT_PROFILES_FILE=<path to this file>  (camera driver AND this node). -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>shm_large</transport_id>
+      <type>SHM</type>
+      <segment_size>268435456</segment_size>
+      <maxMessageSize>33554432</maxMessageSize>
+    </transport_descriptor>
+    <transport_descriptor>
+      <transport_id>udp_big</transport_id>
+      <type>UDPv4</type>
+      <maxMessageSize>65500</maxMessageSize>
+      <sendBufferSize>16777216</sendBufferSize>
+      <receiveBufferSize>16777216</receiveBufferSize>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="shm_large_participant" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>shm_large</transport_id>
+        <transport_id>udp_big</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>
