@@ -16,11 +16,14 @@ doubles as a live check of that calibration.
 | camera models | `plumb_bob`, `fisheye`, `omnidir`, `equirectangular` (the `camera_model` field of `calib.json`) |
 
 ## Build
-
+ 
 ```
 sudo apt install nlohmann-json3-dev
-cd <ws>/src && git clone https://github.com/ChenCN22/lidar_camera_fusion.git
-cd <ws> && rosdep install --from-paths src -iy && colcon build --packages-select lidar_camera_fusion
+cd <your_worksapce>/src
+git clone https://github.com/ChenCN22/lidar_camera_fusion.git
+cd <your_worksapce>
+rosdep install --from-paths src -iy 
+colcon build --packages-select lidar_camera_fusion
 ```
 
 ## Run
@@ -52,8 +55,12 @@ Each point is then given to the camera whose optical axis is closer to it, so th
 | `point_radius` | 2 | radius (px) of the points drawn on the overlap image |
 
 Images larger than the Fast-DDS shared-memory segment (512 KB by default) are sent as UDP fragments and frames or clouds
-get lost. For such images start the camera driver and this node with
+get lost. 
+
+For such images start the camera driver and this node with
 `export FASTRTPS_DEFAULT_PROFILES_FILE=<path>/config/fastdds_shm_large.xml`.
+
+This xml is included in `./config/` in this repo.
 
 ## Example: Ouster OS-1-128 + Insta360 X4 (two fisheye lenses)
 
